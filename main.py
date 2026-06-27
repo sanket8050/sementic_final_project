@@ -493,4 +493,606 @@ class _TTLEmbeddingCache:
     text itself (so if a candidate's search_text changes, it's treated as a
     new cache entry automatically -- no stale-data risk). Entries expire
     after `ttl` seconds. Nothing here ever touches MongoDB; restarting the
-    proc
+    process clears it entirely, which is the explicit design intent.
+    """
+
+    def __init__(self, ttl: int) -> None:
+        self._ttl = ttl
+        self._store: dict[str, tuple[float, np.ndarray]] = {}
+
+    @staticmethod
+    def _key(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def get(self, text: str) -> np.ndarray | None:
+        key = self._key(text)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        expires_at, vector = entry
+        if time.time() > expires_at:
+            self._store.pop(key, None)
+            return None
+        return vector
+
+    def set(self, text: str, vector: np.ndarray) -> None:
+        key = self._key(text)
+        self._store[key] = (time.time() + self._ttl, vector)
+
+    def get_or_compute_many(self, texts: list[str]) -> np.ndarray:
+        """
+        Batches embedding computation for cache misses only, preserving
+        input order in the returned array. This is the main perf win: a
+        repeat search against a largely-unchanged resume pool re-embeds
+        almost nothing.
+        """
+        results: list[np.ndarray | None] = [self.get(t) for t in texts]
+        miss_indices = [i for i, v in enumerate(results) if v is None]
+
+        if miss_indices:
+            model = get_embedding_model()
+            miss_texts = [texts[i] for i in miss_indices]
+            computed = model.encode(miss_texts, show_progress_bar=False)
+            for idx, vec in zip(miss_indices, computed):
+                vec = np.asarray(vec, dtype=np.float32)
+                self.set(texts[idx], vec)
+                results[idx] = vec
+
+        return np.vstack(results)  # type: ignore[arg-type]
+
+
+_embedding_cache = _TTLEmbeddingCache(ttl=settings.embedding_cache_ttl)
+
+
+def cosine_similarity_batch(query_vec: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Cosine similarity between one query vector and N candidate vectors."""
+    query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+    matrix_norms = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-8)
+    return matrix_norms @ query_norm
+
+
+# ---------------------------------------------------------------------------
+# SECTION: Query Expansion
+# ---------------------------------------------------------------------------
+
+class ExpandedQuery(BaseModel):
+    intent: QueryIntent
+    expanded_terms: list[str]
+    semantic_text: str
+
+
+def build_expanded_query(intent: QueryIntent, raw_query: str) -> ExpandedQuery:
+    """
+    Combines the recruiter's literal skills/concepts/role with ontology
+    expansion into one rich text blob used purely as the "query side" of
+    the semantic similarity comparison. The raw query is included too, so
+    phrasing nuance Gemini may have dropped isn't fully lost.
+    """
+    seed_terms = list({*intent.skills, *intent.concepts, *( [intent.role] if intent.role else [] )})
+    expanded = expand_terms(seed_terms)
+
+    semantic_text_parts = [raw_query]
+    if intent.role:
+        semantic_text_parts.append(f"Role: {intent.role}")
+    if intent.domain:
+        semantic_text_parts.append(f"Domain: {intent.domain}")
+    if intent.skills:
+        semantic_text_parts.append("Skills: " + ", ".join(intent.skills))
+    if intent.concepts:
+        semantic_text_parts.append("Concepts: " + ", ".join(intent.concepts))
+    if expanded:
+        semantic_text_parts.append("Related: " + ", ".join(expanded))
+
+    return ExpandedQuery(
+        intent=intent,
+        expanded_terms=expanded,
+        semantic_text=" | ".join(semantic_text_parts),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SECTION: Mongo Filtering (cheap structural pre-filter)
+# ---------------------------------------------------------------------------
+
+def build_mongo_filter(intent: QueryIntent) -> dict:
+    """
+    Builds a deliberately LOOSE Mongo filter. The goal here is only to
+    shrink an enormous collection down to a few hundred plausible
+    candidates cheaply -- NOT to make final accept/reject decisions, since
+    that's what the multi-stage ranking below is for. Over-filtering at
+    this stage (e.g. hard experience cutoffs) risks dropping a great
+    candidate due to a missing/odd field; we deliberately bias toward
+    recall here and let scoring handle precision.
+    """
+    conditions: list[dict] = []
+
+    if intent.location:
+        conditions.append(
+            {
+                "output.candidate.location": {
+                    "$regex": re.escape(intent.location),
+                    "$options": "i",
+                }
+            }
+        )
+
+    if intent.experience_min:
+        # Allow some slack below the stated minimum rather than a hard cut,
+        # since "min 2 years" candidates at 1.5-2 years are still relevant
+        # and exact `exp_years_num` granularity in the source data varies.
+        conditions.append(
+            {"exp_years_num": {"$gte": max(intent.experience_min - 1, 0)}}
+        )
+
+    if not conditions:
+        return {}
+
+    return {"$and": conditions}
+
+
+def fetch_candidate_pool(mongo_filter: dict, limit: int) -> list[dict]:
+    collection = get_candidates_collection()
+    projection = {
+        "output.candidate": 1,
+        "output.summary": 1,
+        "output.fit_score": 1,
+        "exp_years_num": 1,
+        "search_text": 1,
+    }
+    try:
+        cursor = collection.find(mongo_filter, projection).limit(limit)
+        return list(cursor)
+    except PyMongoError as exc:
+        logger.error("Mongo query failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Candidate database is temporarily unavailable.",
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# SECTION: Match Score Calculation (multi-stage, explainable ranking)
+# ---------------------------------------------------------------------------
+# Each sub-score is computed independently on a 0-1 scale, then combined
+# with fixed weights. Every sub-score that contributes meaningfully also
+# contributes a human-readable reason fragment, so the final `reason` /
+# `score_breakdown` fields are a direct, traceable explanation of the
+# number -- never a black box.
+
+SCORE_WEIGHTS = {
+    "role": 0.20,
+    "skill": 0.30,
+    "semantic": 0.20,
+    "experience": 0.15,
+    "achievements": 0.05,
+    "location": 0.05,
+    "notice": 0.05,
+}
+assert abs(sum(SCORE_WEIGHTS.values()) - 1.0) < 1e-6
+
+
+def _safe_lower(value: Any) -> str:
+    return str(value).lower() if value else ""
+
+
+def score_role_match(intent: QueryIntent, current_role: str) -> tuple[float, list[str]]:
+    if not intent.role or not current_role:
+        return 0.5, []  # neutral when we lack signal either side
+    role_q = _safe_lower(intent.role)
+    role_c = _safe_lower(current_role)
+    if role_q in role_c or role_c in role_q:
+        return 1.0, [f"Current role '{current_role}' matches requested role"]
+    # Token overlap fallback (e.g. "Backend Developer" vs "Backend Engineer")
+    q_tokens = set(role_q.split())
+    c_tokens = set(role_c.split())
+    overlap = q_tokens & c_tokens
+    if overlap:
+        score = min(1.0, 0.4 + 0.2 * len(overlap))
+        return score, [f"Role overlap with '{current_role}'"]
+    return 0.2, []
+
+
+def score_skill_match(
+    query_skills: list[str], candidate_skills: list[str]
+) -> tuple[float, list[str], list[str]]:
+    """
+    Returns (score, matched_exact_or_related_skills, matched_concepts).
+    Exact matches score highest; ontology-related matches still count, just
+    at a discount -- this is the mechanism that lets a Stripe-only resume
+    match a Razorpay search.
+    """
+    if not query_skills:
+        return 0.5, [], []
+
+    candidate_skills_lower = {s.lower(): s for s in candidate_skills}
+    matched: list[str] = []
+    related_matched: list[str] = []
+    total_weight = 0.0
+
+    for q_skill in query_skills:
+        q_lower = q_skill.lower()
+        if q_lower in candidate_skills_lower:
+            matched.append(candidate_skills_lower[q_lower])
+            total_weight += 1.0
+            continue
+        # Look for a related (ontology-linked) candidate skill
+        found_related = False
+        for c_lower, c_original in candidate_skills_lower.items():
+            if are_related(q_skill, c_lower):
+                related_matched.append(c_original)
+                total_weight += 0.6
+                found_related = True
+                break
+        if not found_related:
+            continue
+
+    score = min(1.0, total_weight / max(len(query_skills), 1))
+    deduped_matched = list(dict.fromkeys(matched))
+    deduped_related = list(dict.fromkeys(related_matched))
+    return score, deduped_matched, deduped_related
+
+
+def score_semantic_match(similarity: float) -> tuple[float, list[str]]:
+    # Cosine similarity is typically in [-1, 1] but for sentence embeddings
+    # of related professional text it's almost always in [0, 1]. Clamp and
+    # pass through directly -- this score IS the semantic signal.
+    clamped = max(0.0, min(1.0, similarity))
+    reasons = []
+    if clamped >= 0.6:
+        reasons.append("Strong overall semantic match to the role description")
+    elif clamped >= 0.4:
+        reasons.append("Moderate semantic alignment with the role description")
+    return clamped, reasons
+
+
+def score_experience_match(
+    required_min: Optional[int], candidate_years: Optional[float]
+) -> tuple[float, list[str]]:
+    if required_min is None:
+        return 0.7, []
+    if candidate_years is None:
+        return 0.3, []
+    if candidate_years >= required_min:
+        bonus = "Experience exceeds requirement" if candidate_years > required_min else "Meets required experience"
+        return 1.0, [bonus]
+    # Partial credit that decays the further below the bar they are
+    ratio = candidate_years / required_min if required_min > 0 else 1.0
+    return max(0.0, ratio * 0.8), []
+
+
+def score_achievements_match(
+    query_terms: list[str], achievements: list[str]
+) -> tuple[float, list[str]]:
+    if not achievements or not query_terms:
+        return 0.0, []
+    text = " ".join(str(a) for a in achievements).lower()
+    hits = [t for t in query_terms if t.lower() in text]
+    if not hits:
+        return 0.0, []
+    score = min(1.0, 0.3 + 0.2 * len(hits))
+    return score, [f"Key achievement involving {hits[0]}"]
+
+
+def score_location_match(
+    required_location: Optional[str], candidate_location: Optional[str]
+) -> tuple[float, list[str]]:
+    if not required_location:
+        return 1.0, []  # no preference stated -> don't penalise anyone
+    if not candidate_location:
+        return 0.3, []
+    if required_location.lower() in candidate_location.lower():
+        return 1.0, [f"Located in {candidate_location}"]
+    return 0.1, []
+
+
+def score_notice_match(notice_period: Optional[str]) -> tuple[float, list[str]]:
+    """
+    No explicit "required notice period" exists in the current query intent
+    schema, so this is a mild, self-contained heuristic: shorter notice
+    periods score slightly higher, since availability is generally a soft
+    positive for recruiters. Kept low-weight (5%) by design.
+    """
+    if not notice_period:
+        return 0.5, []
+    digits = re.findall(r"\d+", str(notice_period))
+    if not digits:
+        return 0.5, []
+    days = int(digits[0])
+    if days <= 15:
+        return 1.0, ["Short notice period"]
+    if days <= 30:
+        return 0.8, []
+    if days <= 60:
+        return 0.6, []
+    return 0.4, []
+
+
+def calculate_match_score(
+    expanded_query: ExpandedQuery,
+    candidate_doc: dict,
+    semantic_similarity: float,
+) -> tuple[int, dict[str, int], list[str], list[str], str]:
+    """
+    Runs all sub-scores for one candidate and combines them.
+    Returns: (final_score_pct, score_breakdown_pct, matched_skills,
+              matched_concepts, reason_text)
+    """
+    output = candidate_doc.get("output", {}) or {}
+    candidate_info = output.get("candidate", {}) or {}
+    summary = output.get("summary", {}) or {}
+
+    intent = expanded_query.intent
+    candidate_skills = summary.get("technical_skills", []) or []
+    achievements = summary.get("key_achievements", []) or []
+    current_role = summary.get("current_role", "") or ""
+    candidate_location = candidate_info.get("location")
+    notice_period = candidate_info.get("notice_period")
+    candidate_years = candidate_doc.get("exp_years_num")
+
+    role_score, role_reasons = score_role_match(intent, current_role)
+
+    query_skills_for_match = list({*intent.skills, *intent.concepts})
+    skill_score, matched_skills, related_skills = score_skill_match(
+        query_skills_for_match, candidate_skills
+    )
+    skill_reasons = []
+    if matched_skills:
+        skill_reasons.append("Strong " + ", ".join(matched_skills[:4]) + " experience")
+    if related_skills:
+        skill_reasons.append(
+            "Related technology experience: " + ", ".join(related_skills[:3])
+        )
+
+    semantic_score, semantic_reasons = score_semantic_match(semantic_similarity)
+
+    experience_score, experience_reasons = score_experience_match(
+        intent.experience_min, candidate_years
+    )
+
+    all_query_terms = list({*intent.skills, *intent.concepts, *expanded_query.expanded_terms})
+    achievement_score, achievement_reasons = score_achievements_match(
+        all_query_terms, achievements
+    )
+
+    location_score, location_reasons = score_location_match(
+        intent.location, candidate_location
+    )
+
+    notice_score, notice_reasons = score_notice_match(notice_period)
+
+    breakdown_raw = {
+        "role": role_score,
+        "skill": skill_score,
+        "semantic": semantic_score,
+        "experience": experience_score,
+        "achievements": achievement_score,
+        "location": location_score,
+        "notice": notice_score,
+    }
+
+    final_score = sum(breakdown_raw[k] * SCORE_WEIGHTS[k] for k in SCORE_WEIGHTS)
+    final_score_pct = round(final_score * 100)
+    breakdown_pct = {k: round(v * 100) for k, v in breakdown_raw.items()}
+
+    matched_concepts = [
+        c for c in intent.concepts if c.lower() in " ".join(candidate_skills + achievements).lower()
+    ] or related_skills[:3]
+
+    all_reasons = (
+        role_reasons
+        + skill_reasons
+        + semantic_reasons
+        + experience_reasons
+        + achievement_reasons
+        + location_reasons
+        + notice_reasons
+    )
+    reason_text = ". ".join(all_reasons) if all_reasons else "General profile alignment with the search criteria."
+
+    combined_skills = list(dict.fromkeys(matched_skills + related_skills))
+    return final_score_pct, breakdown_pct, combined_skills, matched_concepts, reason_text
+
+
+# ---------------------------------------------------------------------------
+# SECTION: Semantic Ranking (orchestrates embeddings + scoring over a pool)
+# ---------------------------------------------------------------------------
+
+def rank_candidates(
+    expanded_query: ExpandedQuery, candidate_docs: list[dict]
+) -> list[CandidateResult]:
+    if not candidate_docs:
+        return []
+
+    model = get_embedding_model()
+    query_vector = np.asarray(
+        model.encode([expanded_query.semantic_text], show_progress_bar=False)[0],
+        dtype=np.float32,
+    )
+
+    search_texts = [doc.get("search_text", "") or "" for doc in candidate_docs]
+    candidate_matrix = _embedding_cache.get_or_compute_many(search_texts)
+
+    similarities = cosine_similarity_batch(query_vector, candidate_matrix)
+
+    results: list[CandidateResult] = []
+    for doc, similarity in zip(candidate_docs, similarities):
+        score_pct, breakdown, matched_skills, matched_concepts, reason = calculate_match_score(
+            expanded_query, doc, float(similarity)
+        )
+
+        candidate_info = (doc.get("output", {}) or {}).get("candidate", {}) or {}
+        first_name = candidate_info.get("first_name", "") or ""
+        last_name = candidate_info.get("last_name", "") or ""
+        full_name = f"{first_name} {last_name}".strip() or "Unknown Candidate"
+
+        results.append(
+            CandidateResult(
+                id=str(doc.get("_id")),
+                name=full_name,
+                experience=doc.get("exp_years_num"),
+                location=candidate_info.get("location"),
+                match_score=score_pct,
+                matched_skills=matched_skills[:8],
+                matched_concepts=matched_concepts[:5],
+                reason=reason,
+                score_breakdown=breakdown,
+            )
+        )
+
+    results.sort(key=lambda r: r.match_score, reverse=True)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# SECTION: Response Formatter
+# ---------------------------------------------------------------------------
+
+def format_search_response(query: str, ranked: list[CandidateResult], max_results: int) -> SearchResponse:
+    top = ranked[:max_results]
+    return SearchResponse(query=query, result_count=len(top), results=top)
+
+
+# ---------------------------------------------------------------------------
+# SECTION: Utilities
+# ---------------------------------------------------------------------------
+
+def to_object_id(raw_id: str) -> ObjectId:
+    try:
+        return ObjectId(raw_id)
+    except (InvalidId, TypeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{raw_id}' is not a valid candidate id.",
+        ) from exc
+
+
+def serialize_mongo_doc(doc: dict) -> dict:
+    """Recursively converts ObjectId / non-JSON-native values for the API response."""
+    if isinstance(doc, dict):
+        return {k: serialize_mongo_doc(v) for k, v in doc.items()}
+    if isinstance(doc, list):
+        return [serialize_mongo_doc(v) for v in doc]
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# SECTION: FastAPI Endpoints
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="ResumeSync AI Search API",
+    description="AI-powered natural language candidate search backend.",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    problems = settings.validate()
+    if problems:
+        for p in problems:
+            logger.warning("Configuration issue: %s", p)
+    else:
+        logger.info("Configuration OK.")
+
+
+@app.get("/health", response_model=HealthResponse, tags=["system"])
+def health() -> HealthResponse:
+    mongo_ok = False
+    try:
+        get_mongo_client().admin.command("ping")
+        mongo_ok = True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Health check: Mongo not reachable: %s", exc)
+
+    return HealthResponse(
+        status="ok" if mongo_ok else "degraded",
+        mongo_connected=mongo_ok,
+        gemini_configured=bool(settings.gemini_api_key),
+    )
+
+
+@app.post("/search", response_model=SearchResponse, tags=["search"])
+def search_candidates(request: SearchRequest) -> SearchResponse:
+    query_text = request.query.strip()
+    if not query_text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Query must not be empty.",
+        )
+
+    # Step 1 (done): query received.
+    # Step 2: Gemini extracts structured intent.
+    intent = extract_query_intent(query_text)
+
+    # Step 3: ontology-based expansion (internal use only).
+    expanded_query = build_expanded_query(intent, query_text)
+
+    # Step 4: cheap Mongo structural pre-filter.
+    mongo_filter = build_mongo_filter(intent)
+    candidate_pool = fetch_candidate_pool(mongo_filter, settings.candidate_pool_limit)
+
+    # If the (deliberately loose) filter still returns nothing -- e.g. an
+    # overly specific location with no candidates -- retry once with no
+    # filter at all, biasing hard toward recall as the spec requires.
+    if not candidate_pool and mongo_filter:
+        logger.info("No candidates from filtered query; retrying unfiltered.")
+        candidate_pool = fetch_candidate_pool({}, settings.candidate_pool_limit)
+
+    if not candidate_pool:
+        return SearchResponse(query=query_text, result_count=0, results=[])
+
+    # Steps 5-6: semantic similarity + multi-stage ranking.
+    try:
+        ranked = rank_candidates(expanded_query, candidate_pool)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Ranking failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to rank candidates.",
+        ) from exc
+
+    # Step 7: return only the best candidates.
+    return format_search_response(query_text, ranked, settings.max_results)
+
+
+@app.get("/candidate/{candidate_id}", tags=["search"])
+def get_candidate(candidate_id: str) -> dict:
+    object_id = to_object_id(candidate_id)
+    collection = get_candidates_collection()
+    try:
+        doc = collection.find_one({"_id": object_id})
+    except PyMongoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Candidate database is temporarily unavailable.",
+        ) from exc
+
+    if doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No candidate found with id '{candidate_id}'.",
+        )
+
+    return serialize_mongo_doc(doc)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=bool(os.getenv("RELOAD", "")),
+    )
