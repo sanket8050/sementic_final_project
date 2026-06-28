@@ -31,6 +31,7 @@ Design summary (see inline section comments for detail):
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import json
@@ -756,14 +757,46 @@ async def add_request_id_middleware(request: Request, call_next):
     response.headers["X-Request-ID"] = req_id
     return response
 
+_REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT", "30"))
+
+@app.middleware("http")
+async def timeout_middleware(request: Request, call_next):
+    """Cancel any request that takes longer than REQUEST_TIMEOUT seconds.
+
+    This is a safety net that prevents a single slow /search call (e.g. a
+    hung Gemini connection) from tying up a worker indefinitely.
+    """
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=_REQUEST_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Request timed out after %d seconds: %s %s",
+            _REQUEST_TIMEOUT_SECONDS, request.method, request.url.path,
+        )
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            content={"detail": f"Request timed out after {_REQUEST_TIMEOUT_SECONDS} seconds."},
+        )
+
+
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     problems = settings.validate()
     if problems:
         for p in problems:
             logger.warning("Configuration issue: %s", p)
     else:
         logger.info("Configuration OK. Application starting.")
+
+    # Pre-load the embedding model in a thread pool so the first /search
+    # request doesn't block for 20-30 seconds on a cold start.
+    logger.info("Pre-loading embedding model on startup...")
+    try:
+        await asyncio.to_thread(get_embedding_model)
+        logger.info("Embedding model pre-loaded successfully.")
+    except Exception:
+        logger.exception("Failed to pre-load embedding model on startup; it will be loaded on first request.")
 
 @app.get("/health", response_model=HealthResponse, tags=["system"])
 def health() -> HealthResponse:
@@ -781,7 +814,7 @@ def health() -> HealthResponse:
     )
 
 @app.post("/search", response_model=SearchResponse, tags=["search"])
-def search_candidates(request: SearchRequest) -> SearchResponse:
+async def search_candidates(request: SearchRequest) -> SearchResponse:
     start_total = time.perf_counter()
     query_text = request.query.strip()
     
@@ -794,26 +827,34 @@ def search_candidates(request: SearchRequest) -> SearchResponse:
     logger.info("STEP 1: Request received. Query: '%s'", query_text)
 
     # Step 2: Query Understanding (Gemini with failsafe)
+    # Offloaded to a thread pool so the blocking Gemini HTTP call (and its
+    # internal 5-second timeout) does not freeze the event loop.
     step = time.perf_counter()
-    intent = extract_query_intent(query_text)
+    intent = await asyncio.to_thread(extract_query_intent, query_text)
     logger.info("STEP 2 (Intent Extraction) completed in %.2f sec", time.perf_counter() - step)
 
-    # Step 3: Ontology Expansion
+    # Step 3: Ontology Expansion (pure CPU, fast, but keep consistent)
     step = time.perf_counter()
     expanded_query = build_expanded_query(intent, query_text)
     logger.info("STEP 3 (Query Expansion) completed in %.2f sec", time.perf_counter() - step)
 
     # Step 4: Mongo Pre-filter
+    # Offloaded to a thread pool so the blocking PyMongo network call does
+    # not freeze the event loop.
     step = time.perf_counter()
     mongo_filter = build_mongo_filter(intent)
-    
+
     try:
-        candidate_pool = fetch_candidate_pool(mongo_filter, settings.candidate_pool_limit)
-        
+        candidate_pool = await asyncio.to_thread(
+            fetch_candidate_pool, mongo_filter, settings.candidate_pool_limit
+        )
+
         if not candidate_pool and mongo_filter:
             logger.info("No candidates from filtered query; retrying unfiltered fallback.")
-            candidate_pool = fetch_candidate_pool({}, settings.candidate_pool_limit)
-            
+            candidate_pool = await asyncio.to_thread(
+                fetch_candidate_pool, {}, settings.candidate_pool_limit
+            )
+
     except HTTPException:
         raise
     except Exception:
@@ -822,17 +863,19 @@ def search_candidates(request: SearchRequest) -> SearchResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve candidates from database.",
         )
-        
+
     logger.info("STEP 4 (Mongo Fetch) completed in %.2f sec", time.perf_counter() - step)
 
     if not candidate_pool:
         logger.info("TOTAL SEARCH TIME %.2f sec (0 Results)", time.perf_counter() - start_total)
         return SearchResponse(query=query_text, result_count=0, results=[])
 
-    # Steps 5: Semantic Ranking
+    # Step 5: Semantic Ranking
+    # Offloaded to a thread pool because sentence-transformers model.encode()
+    # is CPU-bound and would block the event loop for the entire batch.
     step = time.perf_counter()
     try:
-        ranked = rank_candidates(expanded_query, candidate_pool)
+        ranked = await asyncio.to_thread(rank_candidates, expanded_query, candidate_pool)
     except Exception:
         logger.exception("Ranking execution failed")
         raise HTTPException(
@@ -844,7 +887,7 @@ def search_candidates(request: SearchRequest) -> SearchResponse:
     # Telemetry and Final Return
     total_time = time.perf_counter() - start_total
     logger.info("TOTAL SEARCH TIME %.2f sec", total_time)
-    
+
     if total_time > 5.0:
         logger.warning("WARNING: Slow search detected | Total time: %.2f sec", total_time)
 
@@ -877,5 +920,6 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
+        workers=int(os.getenv("WORKERS", "4")),
         reload=bool(os.getenv("RELOAD", "")),
     )
